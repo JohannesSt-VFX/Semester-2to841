@@ -1,0 +1,10 @@
+# Build artifacts
+build/
+dist/
+*.spec
+lumina.ico
+__pycache__/
+*.pyc
+
+# Runtime config
+.lumina_widget.json
