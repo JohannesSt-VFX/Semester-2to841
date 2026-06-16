@@ -10,7 +10,10 @@ background.
 ## Modules
 1. **Analog clock** — minimal, thin stroke, yellow second hand, no numbers
 2. **CPU temperature** — live °C readout + thin progress arc (WMI / LibreHardwareMonitor, falling back to psutil)
-3. **Network activity** — live up/download rates as scrolling spark lines
+3. **Memory usage** — thin bar + percentage and used/total GB
+4. **Network activity** — live down/upload rates as scrolling spark lines
+5. **Disk I/O** — live read/write rates as scrolling spark lines
+6. **Battery** — percentage + charging state (shown only on laptops)
 
 Each module has a small toggle to collapse/expand it. The whole widget is
 draggable from anywhere on its body, remembers its position, and polls once per

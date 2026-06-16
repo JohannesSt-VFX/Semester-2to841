@@ -4,9 +4,12 @@ r"""
 ================================================================================
 
 A dark, frameless, always-on-top floating widget that stacks small modules:
-    1. Analog clock   — minimal, thin stroke, yellow second hand, no numbers
+    1. Analog clock    — minimal, thin stroke, yellow second hand, no numbers
     2. CPU temperature — live readout + thin progress arc
-    3. Network activity — live up/down rates as scrolling spark lines
+    3. Memory usage    — thin bar + percentage and used/total GB
+    4. Network activity — live down/up rates as scrolling spark lines
+    5. Disk I/O        — live read/write rates as scrolling spark lines
+    6. Battery         — percentage + charging state (laptops only)
 
 --------------------------------------------------------------------------------
 HOW TO RUN (quick, from source)
@@ -423,21 +426,48 @@ class CpuTempModule(WidgetModule):
 
 
 # =============================================================================
-# Module 3 — Network activity (up/down spark lines)
+# Shared helpers for rate spark-line modules
 # =============================================================================
-class NetworkModule(WidgetModule):
-    title = "NETWORK"
+def fmt_rate(bytes_per_s: float) -> str:
+    if bytes_per_s >= 1_000_000:
+        return f"{bytes_per_s / 1_048_576:.1f} MB/s"
+    return f"{bytes_per_s / 1024:.1f} KB/s"
+
+
+def draw_spark(canvas: tk.Canvas, hist: deque, color: str, w: int, h: int) -> None:
+    canvas.delete("spark")
+    peak = max(hist) or 1.0
+    n = len(hist)
+    step = w / max(1, n - 1)
+    pts = []
+    for i, v in enumerate(hist):
+        pts.extend((i * step, h - 1 - (v / peak) * (h - 2)))
+    if len(pts) >= 4:
+        canvas.create_line(*pts, fill=color, width=1, smooth=True, tags="spark")
+
+
+class RateModule(WidgetModule):
+    """Base for two scrolling spark-line rows fed by per-second byte deltas.
+
+    Subclasses set ``ROWS`` (a tuple of ``(tag, color)`` pairs) and implement
+    ``read_counters()`` returning cumulative byte counts in the same order.
+    """
+
     W, H = 184, 26
-    HISTORY = W // 2  # number of samples retained
+    HISTORY = W // 2
+    ROWS: tuple[tuple[str, str], ...] = (("A", ACCENT), ("B", FG))
+
+    def read_counters(self) -> tuple[float, ...]:  # pragma: no cover
+        raise NotImplementedError
 
     def build_body(self, body: tk.Frame) -> None:
-        self._last = psutil.net_io_counters()
+        self._last = self.read_counters()
         self._last_t = time.time()
-        self.up_hist: deque[float] = deque([0.0] * self.HISTORY, maxlen=self.HISTORY)
-        self.down_hist: deque[float] = deque([0.0] * self.HISTORY, maxlen=self.HISTORY)
-
-        self.down_lbl, self.down_canvas = self._row(body, "DN", ACCENT)
-        self.up_lbl, self.up_canvas = self._row(body, "UP", FG)
+        self._rows = []
+        for tag, color in self.ROWS:
+            lbl, canvas = self._row(body, tag, color)
+            hist: deque[float] = deque([0.0] * self.HISTORY, maxlen=self.HISTORY)
+            self._rows.append((lbl, canvas, color, hist))
 
     def _row(self, parent: tk.Frame, tag: str, color: str):
         row = tk.Frame(parent, bg=BG)
@@ -456,40 +486,113 @@ class NetworkModule(WidgetModule):
         self.app.make_draggable(canvas)
         return val, canvas
 
-    @staticmethod
-    def _fmt(bytes_per_s: float) -> str:
-        if bytes_per_s >= 1_000_000:
-            return f"{bytes_per_s / 1_048_576:.1f} MB/s"
-        return f"{bytes_per_s / 1024:.1f} KB/s"
-
-    def _draw(self, canvas: tk.Canvas, hist: deque[float], color: str) -> None:
-        canvas.delete("spark")
-        peak = max(hist) or 1.0
-        n = len(hist)
-        step = self.W / max(1, n - 1)
-        pts = []
-        for i, v in enumerate(hist):
-            x = i * step
-            y = self.H - 1 - (v / peak) * (self.H - 2)
-            pts.extend((x, y))
-        if len(pts) >= 4:
-            canvas.create_line(*pts, fill=color, width=1,
-                               smooth=True, tags="spark")
-
     def poll(self) -> None:
-        now = psutil.net_io_counters()
+        now = self.read_counters()
         t = time.time()
         dt = max(1e-6, t - self._last_t)
-        up_rate = (now.bytes_sent - self._last.bytes_sent) / dt
-        down_rate = (now.bytes_recv - self._last.bytes_recv) / dt
+        for (lbl, canvas, color, hist), cur, prev in zip(self._rows, now, self._last):
+            rate = (cur - prev) / dt
+            hist.append(rate)
+            lbl.config(text=fmt_rate(rate))
+            draw_spark(canvas, hist, color, self.W, self.H)
         self._last, self._last_t = now, t
 
-        self.up_hist.append(up_rate)
-        self.down_hist.append(down_rate)
-        self.up_lbl.config(text=self._fmt(up_rate))
-        self.down_lbl.config(text=self._fmt(down_rate))
-        self._draw(self.up_canvas, self.up_hist, FG)
-        self._draw(self.down_canvas, self.down_hist, ACCENT)
+
+# =============================================================================
+# Module 3 — Network activity (down/up spark lines)
+# =============================================================================
+class NetworkModule(RateModule):
+    title = "NETWORK"
+    ROWS = (("DN", ACCENT), ("UP", FG))
+
+    def read_counters(self) -> tuple[float, ...]:
+        c = psutil.net_io_counters()
+        return (c.bytes_recv, c.bytes_sent)
+
+
+# =============================================================================
+# Module 4 — Disk I/O (read/write spark lines)
+# =============================================================================
+class DiskModule(RateModule):
+    title = "DISK I/O"
+    ROWS = (("RD", ACCENT), ("WR", FG))
+
+    def read_counters(self) -> tuple[float, ...]:
+        c = psutil.disk_io_counters()
+        return (c.read_bytes, c.write_bytes) if c else (0.0, 0.0)
+
+
+# =============================================================================
+# Module 5 — Memory usage (thin bar + percentage)
+# =============================================================================
+class RamModule(WidgetModule):
+    title = "MEMORY"
+    W, H = 184, 8
+
+    def build_body(self, body: tk.Frame) -> None:
+        head = tk.Frame(body, bg=BG)
+        head.pack(fill="x")
+        self.pct_lbl = tk.Label(head, text="--%", fg=ACCENT, bg=BG,
+                                font=(FONT_FAMILY, 11, "bold"))
+        self.pct_lbl.pack(side="left")
+        self.detail_lbl = tk.Label(head, text="-- / -- GB", **self.label_style())
+        self.detail_lbl.pack(side="right")
+        self.canvas = tk.Canvas(body, width=self.W, height=self.H, bg=BG,
+                                highlightthickness=0, bd=0)
+        self.canvas.pack(fill="x", pady=(4, 0))
+        self.canvas.create_rectangle(0, 0, self.W, self.H, fill=TRACK, outline="")
+        self._fill = None
+        self.app.make_draggable(head)
+        self.app.make_draggable(self.canvas)
+
+    def poll(self) -> None:
+        m = psutil.virtual_memory()
+        if self._fill is not None:
+            self.canvas.delete(self._fill)
+        self._fill = self.canvas.create_rectangle(
+            0, 0, self.W * (m.percent / 100.0), self.H, fill=ACCENT, outline="")
+        self.pct_lbl.config(text=f"{m.percent:.0f}%")
+        gb = 1024 ** 3
+        self.detail_lbl.config(text=f"{m.used / gb:.1f} / {m.total / gb:.1f} GB")
+
+
+# =============================================================================
+# Module 6 — Battery (percentage + charging state); only shown if present
+# =============================================================================
+class BatteryModule(WidgetModule):
+    title = "BATTERY"
+
+    @staticmethod
+    def available() -> bool:
+        try:
+            return psutil.sensors_battery() is not None
+        except Exception:
+            return False
+
+    def build_body(self, body: tk.Frame) -> None:
+        row = tk.Frame(body, bg=BG)
+        row.pack(fill="x")
+        self.pct_lbl = tk.Label(row, text="--%", fg=ACCENT, bg=BG,
+                                font=(FONT_FAMILY, 14, "bold"))
+        self.pct_lbl.pack(side="left")
+        self.state_lbl = tk.Label(row, text="", **self.label_style())
+        self.state_lbl.pack(side="right")
+        self.app.make_draggable(row)
+
+    def poll(self) -> None:
+        b = psutil.sensors_battery()
+        if b is None:
+            self.pct_lbl.config(text="n/a")
+            return
+        self.pct_lbl.config(text=f"{b.percent:.0f}%")
+        if b.power_plugged:
+            state = "charging" if b.percent < 100 else "full"
+        elif b.secsleft not in (psutil.POWER_TIME_UNLIMITED,
+                                psutil.POWER_TIME_UNKNOWN) and b.secsleft > 0:
+            state = f"{b.secsleft // 3600}h{(b.secsleft % 3600) // 60:02d}m left"
+        else:
+            state = "on battery"
+        self.state_lbl.config(text=state)
 
 
 # =============================================================================
@@ -580,7 +683,10 @@ class App:
 
     def _build_modules(self) -> None:
         # >>> Register new modules here <<<
-        for cls in (ClockModule, CpuTempModule, NetworkModule):
+        classes = [ClockModule, CpuTempModule, RamModule, NetworkModule, DiskModule]
+        if BatteryModule.available():           # laptops only
+            classes.append(BatteryModule)
+        for cls in classes:
             self.modules.append(cls(self, self.container))
 
     # -- dragging ------------------------------------------------------------
