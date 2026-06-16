@@ -1,0 +1,13 @@
+# Lumina Widget dependencies
+# Install with:  pip install -r requirements.txt
+
+psutil>=5.9          # CPU load + network counters (cross-platform)
+pystray>=0.19        # system tray icon
+Pillow>=10.0         # tray icon image + PyInstaller icon generation
+
+# --- Windows-only (silently skipped on other platforms) ---------------------
+wmi>=1.5 ; sys_platform == "win32"        # CPU temperature via WMI / LHM bridge
+pywin32>=306 ; sys_platform == "win32"    # COM backend required by wmi
+
+# --- Optional: build a standalone .exe (see build_exe.bat) -------------------
+# pyinstaller>=6.0
