@@ -13,9 +13,13 @@ background.
 3. **Memory usage** — thin bar + percentage and used/total GB
 4. **Network activity** — live down/upload rates as scrolling spark lines
 5. **Disk I/O** — live read/write rates as scrolling spark lines
-6. **Battery** — percentage + charging state (shown only on laptops)
+6. **GPU** — temp arc + load/memory via `nvidia-smi` (LibreHardwareMonitor fallback); shown only if a GPU is detected
+7. **Battery** — percentage + charging state (shown only on laptops)
 
-Each module has a small toggle to collapse/expand it. The whole widget is
+Each module has a small toggle to collapse/expand it (Disk/GPU/Battery start
+collapsed to stay compact). Right-click the widget or click the **⚙** button to
+open **Settings** — adjust opacity, refresh interval, and accent color, all
+saved to the config. The whole widget is
 draggable from anywhere on its body, remembers its position, and polls once per
 second.
 

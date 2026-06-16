@@ -9,7 +9,11 @@ A dark, frameless, always-on-top floating widget that stacks small modules:
     3. Memory usage    — thin bar + percentage and used/total GB
     4. Network activity — live down/up rates as scrolling spark lines
     5. Disk I/O        — live read/write rates as scrolling spark lines
-    6. Battery         — percentage + charging state (laptops only)
+    6. GPU             — temp arc + load/memory (nvidia-smi or LHM; if present)
+    7. Battery         — percentage + charging state (laptops only)
+
+Right-click (or the ⚙ button) opens Settings: opacity, refresh interval, and
+accent color — all persisted to the JSON config.
 
 --------------------------------------------------------------------------------
 HOW TO RUN (quick, from source)
@@ -248,10 +252,12 @@ class WidgetModule:
     """
 
     title = "MODULE"
+    START_COLLAPSED = False   # default state on first launch (no saved config)
 
     def __init__(self, app: "App", parent: tk.Widget) -> None:
         self.app = app
-        self.collapsed = app.config.get("collapsed", {}).get(self.title, False)
+        self.collapsed = app.config.get("collapsed", {}).get(
+            self.title, self.START_COLLAPSED)
 
         self.frame = tk.Frame(parent, bg=BG)
         self.frame.pack(fill="x", padx=12, pady=(2, 6))
@@ -515,6 +521,7 @@ class NetworkModule(RateModule):
 # =============================================================================
 class DiskModule(RateModule):
     title = "DISK I/O"
+    START_COLLAPSED = True
     ROWS = (("RD", ACCENT), ("WR", FG))
 
     def read_counters(self) -> tuple[float, ...]:
@@ -561,6 +568,7 @@ class RamModule(WidgetModule):
 # =============================================================================
 class BatteryModule(WidgetModule):
     title = "BATTERY"
+    START_COLLAPSED = True
 
     @staticmethod
     def available() -> bool:
@@ -596,6 +604,133 @@ class BatteryModule(WidgetModule):
 
 
 # =============================================================================
+# GPU provider — nvidia-smi first, LibreHardwareMonitor (WMI) fallback
+# =============================================================================
+class GpuProvider:
+    """Best-effort GPU stats: {load %, temp °C, mem_used MB, mem_total MB}.
+
+    Prefers `nvidia-smi` (no extra Python dependency). Falls back to a
+    LibreHardwareMonitor/OpenHardwareMonitor WMI bridge for load + temp on
+    other GPUs. Any field may be None when unavailable.
+    """
+
+    def __init__(self) -> None:
+        import shutil
+        self._smi = shutil.which("nvidia-smi")
+        self._ohm = None
+        if not self._smi and _HAS_WMI:
+            for ns in (r"root\LibreHardwareMonitor", r"root\OpenHardwareMonitor"):
+                try:
+                    self._ohm = wmi.WMI(namespace=ns)
+                    break
+                except Exception:
+                    self._ohm = None
+
+    def available(self) -> bool:
+        return bool(self._smi) or self._ohm is not None
+
+    def read(self) -> dict:
+        out = {"load": None, "temp": None, "mem_used": None, "mem_total": None}
+        if self._smi:
+            try:
+                import subprocess
+                q = ("utilization.gpu,temperature.gpu,"
+                     "memory.used,memory.total")
+                res = subprocess.run(
+                    [self._smi, f"--query-gpu={q}",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=2,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                line = res.stdout.strip().splitlines()[0]
+                load, temp, mu, mt = (p.strip() for p in line.split(","))
+                out.update(load=float(load), temp=float(temp),
+                           mem_used=float(mu), mem_total=float(mt))
+                return out
+            except Exception:
+                pass
+        if self._ohm is not None:
+            try:
+                for s in self._ohm.Sensor():
+                    name = s.Name or ""
+                    if "GPU" not in name or s.Value is None:
+                        continue
+                    if s.SensorType == "Temperature" and out["temp"] is None:
+                        out["temp"] = s.Value
+                    elif s.SensorType == "Load" and "Core" in name:
+                        out["load"] = s.Value
+            except Exception:
+                pass
+        return out
+
+
+# =============================================================================
+# Module 7 — GPU (temp arc + load / memory); only shown if a GPU is found
+# =============================================================================
+class GpuModule(WidgetModule):
+    title = "GPU"
+    START_COLLAPSED = True
+    SIZE = 90
+    T_MIN, T_MAX = 20.0, 100.0
+
+    _probe: "GpuProvider | None" = None
+
+    @classmethod
+    def available(cls) -> bool:
+        cls._probe = GpuProvider()
+        return cls._probe.available()
+
+    def build_body(self, body: tk.Frame) -> None:
+        self.provider = self._probe or GpuProvider()
+        wrap = tk.Frame(body, bg=BG)
+        wrap.pack()
+        self.canvas = tk.Canvas(wrap, width=self.SIZE, height=self.SIZE,
+                                bg=BG, highlightthickness=0, bd=0)
+        self.canvas.pack(side="left")
+        self.app.make_draggable(self.canvas)
+
+        info = tk.Frame(wrap, bg=BG)
+        info.pack(side="left", padx=(10, 0))
+        self.value_lbl = tk.Label(info, text="--", fg=ACCENT, bg=BG,
+                                  font=(FONT_FAMILY, 18, "bold"))
+        self.value_lbl.pack(anchor="w")
+        tk.Label(info, text="°C", **self.label_style()).pack(anchor="w")
+        self.load_lbl = tk.Label(info, text="load --%", **self.label_style())
+        self.load_lbl.pack(anchor="w", pady=(6, 0))
+        self.mem_lbl = tk.Label(info, text="", **self.label_style())
+        self.mem_lbl.pack(anchor="w")
+        self.app.make_draggable(info)
+
+        pad = 10
+        self._box = (pad, pad, self.SIZE - pad, self.SIZE - pad)
+        self.canvas.create_arc(*self._box, start=225, extent=-270,
+                               style="arc", outline=TRACK, width=4)
+        self._arc = None
+
+    def poll(self) -> None:
+        d = self.provider.read()
+        if self._arc is not None:
+            self.canvas.delete(self._arc)
+            self._arc = None
+        temp = d["temp"]
+        if temp is None:
+            self.value_lbl.config(text="n/a")
+        else:
+            self.value_lbl.config(text=f"{temp:.0f}")
+            frac = max(0.0, min(1.0, (temp - self.T_MIN) / (self.T_MAX - self.T_MIN)))
+            self._arc = self.canvas.create_arc(
+                *self._box, start=225, extent=-270 * frac,
+                style="arc", outline=ACCENT, width=4)
+        self.load_lbl.config(
+            text="load --%" if d["load"] is None else f"load {d['load']:>3.0f}%")
+        if d["mem_used"] is not None and d["mem_total"]:
+            self.mem_lbl.config(
+                text=f"{d['mem_used']/1024:.1f}/{d['mem_total']/1024:.1f} GB")
+        else:
+            self.mem_lbl.config(text="")
+
+
+# =============================================================================
 # Application shell — window, dragging, tray, polling loop
 # =============================================================================
 class App:
@@ -614,10 +749,13 @@ class App:
             pass
         self.root.overrideredirect(True)          # frameless
         self.root.attributes("-topmost", True)     # always on top
-        try:
-            self.root.attributes("-alpha", OPACITY)  # ~85% opacity
-        except tk.TclError:
-            pass
+
+        # user-tunable settings (persisted in the JSON config)
+        global ACCENT
+        ACCENT = self.config.get("accent", ACCENT)
+        self.opacity = float(self.config.get("opacity", OPACITY))
+        self.poll_ms = int(self.config.get("poll_ms", POLL_MS))
+        self._apply_opacity()
 
         self._ensure_font()
 
@@ -634,6 +772,7 @@ class App:
         self.menu = tk.Menu(self.root, tearoff=0, bg=BG, fg=FG,
                             activebackground=ACCENT, activeforeground=BG,
                             bd=0)
+        self.menu.add_command(label="Settings…", command=self.open_settings)
         self.menu.add_command(label="Hide", command=self.hide)
         self.menu.add_separator()
         self.menu.add_command(label="Exit", command=self.exit_app)
@@ -674,16 +813,22 @@ class App:
         dot.pack(side="left")
         tk.Label(title, text="LUMINA", fg=FG, bg=BG,
                  font=(FONT_FAMILY, 9, "bold")).pack(side="left", padx=(6, 0))
-        tk.Label(title, text="✕", fg=MUTED, bg=BG,
-                 font=(FONT_FAMILY, 9), cursor="hand2").pack(side="right")
-        # the little × hides to tray
-        title.winfo_children()[-1].bind("<Button-1>", lambda e: self.hide())
+        close = tk.Label(title, text="✕", fg=MUTED, bg=BG,
+                         font=(FONT_FAMILY, 9), cursor="hand2")
+        close.pack(side="right")
+        close.bind("<Button-1>", lambda e: self.hide())   # × hides to tray
+        gear = tk.Label(title, text="⚙", fg=MUTED, bg=BG,
+                        font=(FONT_FAMILY, 9), cursor="hand2")
+        gear.pack(side="right", padx=(0, 8))
+        gear.bind("<Button-1>", lambda e: self.open_settings())
         self.make_draggable(title)
         self.make_draggable(dot)
 
     def _build_modules(self) -> None:
         # >>> Register new modules here <<<
         classes = [ClockModule, CpuTempModule, RamModule, NetworkModule, DiskModule]
+        if GpuModule.available():               # nvidia-smi or LHM bridge
+            classes.append(GpuModule)
         if BatteryModule.available():           # laptops only
             classes.append(BatteryModule)
         for cls in classes:
@@ -763,6 +908,8 @@ class App:
             pystray.MenuItem("Show / Hide",
                              lambda: self.root.after(0, self.toggle),
                              default=True),
+            pystray.MenuItem("Settings…",
+                             lambda: self.root.after(0, self.open_settings)),
             pystray.MenuItem("Exit",
                              lambda: self.root.after(0, self.exit_app)),
         )
@@ -785,6 +932,117 @@ class App:
         d.line((32, 32, 44, 38), fill=(230, 230, 230, 255), width=3)
         return img
 
+    # -- settings ------------------------------------------------------------
+    def _apply_opacity(self) -> None:
+        try:
+            self.root.attributes("-alpha", self.opacity)
+        except tk.TclError:
+            pass
+
+    def rebuild_ui(self) -> None:
+        """Tear down and recreate chrome + modules (used after a theme change)."""
+        for m in self.modules:
+            m.frame.destroy()
+        self.modules.clear()
+        self.container.destroy()
+        self._build_chrome()
+        self._build_modules()
+        self.fit_to_content()
+
+    def open_settings(self) -> None:
+        if getattr(self, "_settings_win", None) is not None:
+            try:
+                self._settings_win.lift()
+                return
+            except tk.TclError:
+                self._settings_win = None
+        if not self._visible:
+            self.show()
+
+        win = tk.Toplevel(self.root, bg=BG)
+        self._settings_win = win
+        win.title("Lumina Settings")
+        win.configure(padx=16, pady=14)
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+
+        def on_close():
+            self._settings_win = None
+            win.destroy()
+        win.protocol("WM_DELETE_WINDOW", on_close)
+
+        def label(txt):
+            tk.Label(win, text=txt, fg=MUTED, bg=BG,
+                     font=(FONT_FAMILY, 9, "bold")).pack(anchor="w", pady=(8, 0))
+
+        # opacity ------------------------------------------------------------
+        label("OPACITY")
+        opacity_var = tk.IntVar(value=int(self.opacity * 100))
+
+        def on_opacity(v):
+            self.opacity = max(0.3, int(float(v)) / 100.0)
+            self._apply_opacity()
+        tk.Scale(win, from_=30, to=100, orient="horizontal", variable=opacity_var,
+                 command=on_opacity, length=200, bg=BG, fg=FG, troughcolor=TRACK,
+                 highlightthickness=0, bd=0, font=(FONT_FAMILY, 8)).pack(fill="x")
+
+        # poll interval ------------------------------------------------------
+        label("REFRESH INTERVAL (ms)")
+        poll_var = tk.IntVar(value=self.poll_ms)
+
+        def on_poll(v):
+            self.poll_ms = max(250, int(float(v)))
+        tk.Scale(win, from_=250, to=5000, resolution=250, orient="horizontal",
+                 variable=poll_var, command=on_poll, length=200, bg=BG, fg=FG,
+                 troughcolor=TRACK, highlightthickness=0, bd=0,
+                 font=(FONT_FAMILY, 8)).pack(fill="x")
+
+        # accent color -------------------------------------------------------
+        label("ACCENT COLOR")
+        swatch_row = tk.Frame(win, bg=BG)
+        swatch_row.pack(fill="x", pady=(2, 0))
+        preview = tk.Label(swatch_row, text="  ", bg=ACCENT, width=3)
+        preview.pack(side="right")
+
+        def set_accent(color):
+            global ACCENT
+            ACCENT = color
+            preview.config(bg=color)
+            self.rebuild_ui()
+
+        presets = ["#ffd400", "#00e5ff", "#36e07a", "#ff5da2", "#ff7a18", "#b388ff"]
+        for c in presets:
+            sw = tk.Label(swatch_row, bg=c, width=2, cursor="hand2", bd=0)
+            sw.pack(side="left", padx=2)
+            sw.bind("<Button-1>", lambda e, col=c: set_accent(col))
+
+        def pick_custom():
+            from tkinter import colorchooser
+            rgb = colorchooser.askcolor(color=ACCENT, parent=win,
+                                        title="Pick accent color")
+            if rgb and rgb[1]:
+                set_accent(rgb[1])
+        tk.Button(win, text="Custom…", command=pick_custom, bg=TRACK, fg=FG,
+                  relief="flat", font=(FONT_FAMILY, 8),
+                  activebackground=ACCENT).pack(anchor="w", pady=(6, 0))
+
+        # buttons ------------------------------------------------------------
+        btns = tk.Frame(win, bg=BG)
+        btns.pack(fill="x", pady=(14, 0))
+
+        def save_and_close():
+            self.config["opacity"] = self.opacity
+            self.config["poll_ms"] = self.poll_ms
+            self.config["accent"] = ACCENT
+            save_config(self.config)
+            on_close()
+        tk.Button(btns, text="Save", command=save_and_close, bg=ACCENT, fg=BG,
+                  relief="flat", font=(FONT_FAMILY, 9, "bold"),
+                  activebackground=ACCENT).pack(side="right")
+        tk.Button(btns, text="Close", command=on_close, bg=TRACK, fg=FG,
+                  relief="flat", font=(FONT_FAMILY, 9),
+                  activebackground=TRACK).pack(side="right", padx=(0, 8))
+
     # -- polling loop --------------------------------------------------------
     def _poll(self) -> None:
         if self._visible:
@@ -793,7 +1051,7 @@ class App:
                     m.poll()
                 except Exception:
                     pass  # one bad module must not stall the others
-        self.root.after(POLL_MS, self._poll)
+        self.root.after(self.poll_ms, self._poll)
 
     def run(self) -> None:
         self.root.mainloop()
